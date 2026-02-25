@@ -122,6 +122,28 @@ func (c *Cluster) AddNode(node *Node) error {
 	return nil
 }
 
+// AddNodeWithoutRebalance adds a node without triggering rebalancing
+func (c *Cluster) AddNodeWithoutRebalance(node *Node) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, exists := c.nodes[node.ID]; exists {
+		return ErrNodeExists
+	}
+
+	if node.Weight == 0 {
+		node.Weight = 100
+	}
+
+	node.State = StateFollower
+	c.nodes[node.ID] = node
+	c.rebuildRing()
+
+	// NO assignment - partitions stay where they are
+
+	return nil
+}
+
 // RemoveNode removes a node from the cluster
 func (c *Cluster) RemoveNode(nodeID string) error {
 	c.mu.Lock()

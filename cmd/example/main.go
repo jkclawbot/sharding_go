@@ -11,81 +11,84 @@ import (
 func main() {
 	fmt.Println("=== Tendril-Go Demo ===\n")
 
-	// 1. Create a cluster with 10 partitions
+	// 1. Create a cluster with 10 partitions (no auto-assignment)
 	cluster := sharding.NewCluster("my-cluster", 10)
 	fmt.Printf("Created cluster: %s with %d partitions\n\n", cluster.GetName(), cluster.GetNumPartitions())
 
-	// 2. Add nodes to the cluster
+	// 2. Add 2 nodes
 	nodes := []*sharding.Node{
 		{ID: "node-1", Address: "192.168.1.1:8080", Weight: 100},
 		{ID: "node-2", Address: "192.168.1.2:8080", Weight: 100},
-		{ID: "node-3", Address: "192.168.1.3:8080", Weight: 100},
 	}
 
 	for _, node := range nodes {
-		if err := cluster.AddNode(node); err != nil {
-			log.Printf("Failed to add node %s: %v", node.ID, err)
-		} else {
-			fmt.Printf("Added node: %s at %s\n", node.ID, node.Address)
-		}
+		cluster.AddNodeWithoutRebalance(node)
+		fmt.Printf("Added node: %s at %s (no rebalance)\n", node.ID, node.Address)
 	}
 
-	fmt.Println()
-
-	// 3. Demonstrate consistent hashing
-	keys := []string{
-		"user-100", "user-101", "user-102", "user-103", "user-104",
-		"order-500", "order-501", "order-502", "order-503", "order-504",
-		"product-1", "product-2", "product-3", "product-4", "product-5",
-	}
-
-	fmt.Println("Key to Partition Mapping (consistent hashing):")
-	partitions := make(map[int]int)
-	for _, key := range keys {
-		part := cluster.GetPartition(key)
-		leader := cluster.GetLeader(part)
-		fmt.Printf("  Key '%s' -> Partition %d -> Leader: %s\n", key, part, leader.ID)
-		partitions[part]++
-	}
-
-	fmt.Printf("\nPartition distribution: %v\n", partitions)
-
-	fmt.Println("\n=== Assignment Demo ===")
-
-	// Show current assignment
+	// 3. Assign partitions with 2 nodes
+	fmt.Println("\n--- Assigning partitions (2 nodes) ---")
+	cluster.AssignPartitions(sharding.StrategyRoundRobin)
 	assignment := cluster.GetAssignment()
-	fmt.Println("Current assignment:")
-	for partID, nodeID := range assignment {
-		fmt.Printf("  Partition %d -> %s\n", partID, nodeID)
-	}
+	printAssignment(assignment)
 
-	// Plan rebalancing
+	// 4. Add 3rd node WITHOUT rebalancing (simulates imbalance)
+	fmt.Println("\nAdding node-3 (no rebalance)...")
+	cluster.AddNodeWithoutRebalance(&sharding.Node{ID: "node-3", Address: "192.168.1.3:8080", Weight: 100})
+
+	// Show unbalanced assignment
+	fmt.Println("\n--- Unbalanced Assignment (2 nodes assigned to 3) ---")
+	assignment = cluster.GetAssignment()
+	printAssignment(assignment)
+
+	// Count per node
+	nodeCount := make(map[string]int)
+	for _, nodeID := range assignment {
+		nodeCount[nodeID]++
+	}
+	fmt.Printf("Partitions per node: %v\n", nodeCount)
+
+	// 5. Plan rebalancing to LoadBalanced
+	fmt.Println("\n--- Planning Rebalancing ---")
 	plan, err := cluster.PlanMovement(sharding.StrategyLoadBalanced)
 	if err != nil {
 		log.Printf("PlanMovement error: %v", err)
 	} else {
-		fmt.Printf("\nPlanned movements: %d\n", len(plan))
+		fmt.Printf("Planned movements: %d\n", len(plan))
 		for _, m := range plan {
 			fmt.Printf("  Partition %d: %s -> %s\n", m.PartitionID, m.FromNode.ID, m.ToNode.ID)
 		}
 	}
 
-	// Execute movements
+	// 6. Execute movements
+	fmt.Println("\n--- Executing Movements ---")
 	results := cluster.ExecuteMovementPlan(plan)
 	successCount := 0
 	for _, r := range results {
 		if r.Success {
 			successCount++
+		} else {
+			fmt.Printf("  FAILED: Partition %d: %v\n", r.PartitionID, r.Error)
 		}
 	}
 	fmt.Printf("Executed: %d/%d successful\n", successCount, len(results))
 
-	// Show new assignment
+	// 7. Show final balanced assignment
+	fmt.Println("\n--- Final Assignment (balanced) ---")
 	assignment = cluster.GetAssignment()
-	fmt.Println("\nNew assignment after rebalancing:")
+	printAssignment(assignment)
+
+	nodeCount = make(map[string]int)
+	for _, nodeID := range assignment {
+		nodeCount[nodeID]++
+	}
+	fmt.Printf("Partitions per node: %v\n", nodeCount)
+
+	fmt.Println("\n=== Demo Complete ===")
+}
+
+func printAssignment(assignment map[int]string) {
 	for partID, nodeID := range assignment {
 		fmt.Printf("  Partition %d -> %s\n", partID, nodeID)
 	}
-
-	fmt.Println("\n=== Demo Complete ===")
 }
