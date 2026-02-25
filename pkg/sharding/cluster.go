@@ -13,8 +13,8 @@ type NodeState string
 
 const (
 	StateOffline   NodeState = "OFFLINE"
-	StateFollower  NodeState = "FOLLOWER"
-	StateLeader    NodeState = "LEADER"
+	StateFollower NodeState = "FOLLOWER"
+	StateLeader   NodeState = "LEADER"
 )
 
 // Node represents a node in the cluster
@@ -24,10 +24,63 @@ type Node struct {
 	State          NodeState
 	Weight         int // For weighted consistent hashing
 	PartitionIndex int // Used for partition assignment
+	Resources      map[string]int64 // Resource usage: CPU, Memory, etc.
 }
 
 func (n *Node) IsHealthy() bool {
 	return n.State != StateOffline
+}
+
+func (n *Node) GetResourceUsage(resource string) int64 {
+	if n.Resources == nil {
+		return 0
+	}
+	return n.Resources[resource]
+}
+
+func (n *Node) SetResource(resource string, value int64) {
+	if n.Resources == nil {
+		n.Resources = make(map[string]int64)
+	}
+	n.Resources[resource] = value
+}
+
+// Resource represents a resource with its configuration
+type Resource struct {
+	Name            string
+	Partitions      map[int]*PartitionConfig // PartitionID -> Config
+	DefaultReplicas int                      // Default replication factor
+}
+
+type PartitionConfig struct {
+	Replicas      int            // Replication factor for this partition
+	PreferNodes  []string       // Preferred nodes for this partition
+	ExcludedNodes []string       // Excluded nodes for this partition
+}
+
+// NewResource creates a new resource with default replication factor
+func NewResource(name string, defaultReplicas int) *Resource {
+	return &Resource{
+		Name:            name,
+		Partitions:      make(map[int]*PartitionConfig),
+		DefaultReplicas: defaultReplicas,
+	}
+}
+
+// GetReplicas returns the replication factor for a partition
+func (r *Resource) GetReplicas(partitionID int) int {
+	if config, ok := r.Partitions[partitionID]; ok {
+		return config.Replicas
+	}
+	return r.DefaultReplicas
+}
+
+// SetPartitionReplicas sets custom replication factor for a partition
+func (r *Resource) SetPartitionReplicas(partitionID int, replicas int) {
+	if r.Partitions[partitionID] == nil {
+		r.Partitions[partitionID] = &PartitionConfig{}
+	}
+	r.Partitions[partitionID].Replicas = replicas
 }
 
 // Partition represents a data partition
@@ -36,43 +89,18 @@ type Partition struct {
 	Leader     *Node
 	Followers  []*Node
 	Version    int // For optimistic locking
+	Replicas   int // Replication factor for this partition
 }
-
-// AssignmentResult contains the result of an assignment operation
-type AssignmentResult struct {
-	PartitionID int
-	FromNode    *Node
-	ToNode      *Node
-	Success     bool
-	Error       error
-}
-
-// PartitionMovement represents a planned partition movement
-type PartitionMovement struct {
-	PartitionID int
-	FromNode   *Node
-	ToNode     *Node
-	State      MovementState
-}
-
-// MovementState represents the state of a partition movement
-type MovementState string
-
-const (
-	MovementPending   MovementState = "PENDING"
-	MovementStarted   MovementState = "STARTED"
-	MovementCompleted MovementState = "COMPLETED"
-	MovementFailed    MovementState = "FAILED"
-)
 
 // Cluster manages the sharding cluster
 type Cluster struct {
-	name       string
-	numParts   int
-	nodes      map[string]*Node
-	partitions map[int]*Partition
-	ring       []ringEntry // Sorted by hash for consistent hashing
-	mu         sync.RWMutex
+	name        string
+	numParts    int
+	nodes       map[string]*Node
+	partitions  map[int]*Partition
+	resources   map[string]*Resource // Resource name -> Resource
+	ring        []ringEntry          // Sorted by hash for consistent hashing
+	mu          sync.RWMutex
 }
 
 // ringEntry for consistent hashing
@@ -92,11 +120,12 @@ func NewCluster(name string, numPartitions int) *Cluster {
 		numParts:   numPartitions,
 		nodes:      make(map[string]*Node),
 		partitions: make(map[int]*Partition),
+		resources:  make(map[string]*Resource),
 		ring:       make([]ringEntry, 0),
 	}
 }
 
-// AddNode adds a node to the cluster
+// AddNode adds a node to the cluster (with auto-assignment)
 func (c *Cluster) AddNode(node *Node) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -105,18 +134,13 @@ func (c *Cluster) AddNode(node *Node) error {
 		return ErrNodeExists
 	}
 
-	// Set default weight
 	if node.Weight == 0 {
 		node.Weight = 100
 	}
 
 	node.State = StateFollower
 	c.nodes[node.ID] = node
-
-	// Rebuild the ring
 	c.rebuildRing()
-
-	// Assign partitions
 	c.assignPartitions()
 
 	return nil
@@ -138,8 +162,6 @@ func (c *Cluster) AddNodeWithoutRebalance(node *Node) error {
 	node.State = StateFollower
 	c.nodes[node.ID] = node
 	c.rebuildRing()
-
-	// NO assignment - partitions stay where they are
 
 	return nil
 }
@@ -170,8 +192,6 @@ func (c *Cluster) GetPartition(key string) int {
 	}
 
 	hash := c.hashKey(key)
-
-	// Binary search for the first ring entry with hash >= key hash
 	idx := sort.Search(len(c.ring), func(i int) bool {
 		return c.ring[i].hash >= hash
 	})
@@ -180,11 +200,10 @@ func (c *Cluster) GetPartition(key string) int {
 		idx = 0
 	}
 
-	// Use the node to determine partition
 	node := c.ring[idx].node
 	partID := node.PartitionIndex%c.numParts + c.numParts
 	partID = partID % c.numParts
-	
+
 	return partID
 }
 
@@ -198,7 +217,6 @@ func (c *Cluster) GetNodeForKey(key string) *Node {
 	}
 
 	hash := c.hashKey(key)
-
 	idx := sort.Search(len(c.ring), func(i int) bool {
 		return c.ring[i].hash >= hash
 	})
@@ -221,6 +239,17 @@ func (c *Cluster) GetLeader(partitionID int) *Node {
 	return nil
 }
 
+// GetFollowers returns the follower nodes for a partition
+func (c *Cluster) GetFollowers(partitionID int) []*Node {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if part, ok := c.partitions[partitionID]; ok {
+		return part.Followers
+	}
+	return nil
+}
+
 // GetNodes returns all nodes in the cluster
 func (c *Cluster) GetNodes() []*Node {
 	c.mu.RLock()
@@ -238,62 +267,282 @@ func (c *Cluster) GetPartitionCount() int {
 	return c.numParts
 }
 
-// rebuildRing rebuilds the consistent hashing ring
-func (c *Cluster) rebuildRing() {
-	c.ring = make([]ringEntry, 0, len(c.nodes)*defaultVNodes)
+// ============================================================
+// Resource Management
+// ============================================================
 
-	// Assign partition index to each node
+// AddResource adds a resource with default replication factor
+func (c *Cluster) AddResource(name string, defaultReplicas int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, exists := c.resources[name]; exists {
+		return ErrResourceExists
+	}
+
+	c.resources[name] = NewResource(name, defaultReplicas)
+	return nil
+}
+
+// GetResource returns a resource by name
+func (c *Cluster) GetResource(name string) *Resource {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.resources[name]
+}
+
+// SetResourceDefaultReplicas sets the default replication factor for a resource
+func (c *Cluster) SetResourceDefaultReplicas(resourceName string, replicas int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	res, ok := c.resources[resourceName]
+	if !ok {
+		return ErrResourceNotFound
+	}
+
+	res.DefaultReplicas = replicas
+	return nil
+}
+
+// SetPartitionReplicas sets custom replication factor for a specific partition
+func (c *Cluster) SetPartitionReplicas(resourceName string, partitionID int, replicas int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	res, ok := c.resources[resourceName]
+	if !ok {
+		return ErrResourceNotFound
+	}
+
+	res.SetPartitionReplicas(partitionID, replicas)
+	return nil
+}
+
+// GetPartitionReplicas returns the replication factor for a partition in a resource
+func (c *Cluster) GetPartitionReplicas(resourceName string, partitionID int) int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	res, ok := c.resources[resourceName]
+	if !ok {
+		return 1 // Default
+	}
+
+	return res.GetReplicas(partitionID)
+}
+
+// ============================================================
+// Placement Algorithms
+// ============================================================
+
+// PlacementStrategy defines different placement algorithms
+type PlacementStrategy string
+
+const (
+	PlacementEvenDistribution PlacementStrategy = "EVEN_DISTRIBUTION"
+	PlacementLeaderAware     PlacementStrategy = "LEADER_AWARE"
+	PlacementResourceAware   PlacementStrategy = "RESOURCE_AWARE"
+	PlacementHashBased       PlacementStrategy = "HASH_BASED"
+)
+
+// PlacementResult contains the result of a placement operation
+type PlacementResult struct {
+	PartitionID int
+	Leader      *Node
+	Followers   []*Node
+	Replicas    int
+	Success     bool
+	Error       error
+}
+
+// PlacePartitions places partitions according to the strategy and resource config
+func (c *Cluster) PlacePartitions(resourceName string, strategy PlacementStrategy) []PlacementResult {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	res, ok := c.resources[resourceName]
+	if !ok {
+		return []PlacementResult{{Error: ErrResourceNotFound}}
+	}
+
+	results := make([]PlacementResult, 0, c.numParts)
+
+	for i := 0; i < c.numParts; i++ {
+		replicas := res.GetReplicas(i)
+		result := PlacementResult{
+			PartitionID: i,
+			Replicas:    replicas,
+		}
+
+		var nodes []*Node
+		switch strategy {
+		case PlacementEvenDistribution:
+			nodes = c.placeEvenDistribution(i, replicas)
+		case PlacementLeaderAware:
+			nodes = c.placeLeaderAware(i, replicas)
+		case PlacementResourceAware:
+			nodes = c.placeResourceAware(i, replicas, resourceName)
+		case PlacementHashBased:
+			nodes = c.placeHashBased(i, replicas)
+		default:
+			nodes = c.placeEvenDistribution(i, replicas)
+		}
+
+		if len(nodes) > 0 {
+			result.Leader = nodes[0]
+			if len(nodes) > 1 {
+				result.Followers = nodes[1:]
+			}
+			result.Success = true
+		}
+
+		results = append(results, result)
+	}
+
+	return results
+}
+
+// placeEvenDistribution distributes replicas evenly across all nodes
+func (c *Cluster) placeEvenDistribution(partitionID int, replicas int) []*Node {
+	if len(c.nodes) == 0 {
+		return nil
+	}
+
+	// Get nodes sorted by partition count (least loaded first)
+	nodeList := c.getNodesByLoad()
+
+	if len(nodeList) < replicas {
+		replicas = len(nodeList)
+	}
+
+	selected := make([]*Node, 0, replicas)
+	for i := 0; i < replicas; i++ {
+		selected = append(selected, nodeList[i%len(nodeList)])
+	}
+
+	return selected
+}
+
+// placeLeaderAware places leader on different nodes from existing leaders
+func (c *Cluster) placeLeaderAware(partitionID int, replicas int) []*Node {
+	if len(c.nodes) == 0 {
+		return nil
+	}
+
+	// Find nodes that are not leaders for other partitions
+	leaderNodes := make(map[string]bool)
+	for _, p := range c.partitions {
+		if p.Leader != nil {
+			leaderNodes[p.Leader.ID] = true
+		}
+	}
+
+	// Prefer nodes that are not leaders
+	preferred := make([]*Node, 0)
+	others := make([]*Node, 0)
+
+	for _, n := range c.nodes {
+		if !leaderNodes[n.ID] {
+			preferred = append(preferred, n)
+		} else {
+			others = append(others, n)
+		}
+	}
+
+	// Combine: preferred first, then others
+	all := append(preferred, others...)
+
+	if len(all) < replicas {
+		replicas = len(all)
+	}
+
+	return all[:replicas]
+}
+
+// placeResourceAware considers node resource usage for placement
+func (c *Cluster) placeResourceAware(partitionID int, replicas int, resourceName string) []*Node {
+	if len(c.nodes) == 0 {
+		return nil
+	}
+
+	// Sort by specified resource (lowest usage first)
 	nodeList := make([]*Node, 0, len(c.nodes))
 	for _, n := range c.nodes {
 		nodeList = append(nodeList, n)
 	}
-	
-	for i, node := range nodeList {
-		node.PartitionIndex = i
-		for j := 0; j < defaultVNodes; j++ {
-			ringKey := fmt.Sprintf("%s-%d-%d", node.ID, node.Weight, j)
-			entry := ringEntry{
-				hash: c.hashKey(ringKey),
-				node: node,
-			}
-			c.ring = append(c.ring, entry)
+
+	sort.Slice(nodeList, func(i, j int) bool {
+		ri := nodeList[i].GetResourceUsage(resourceName)
+		rj := nodeList[j].GetResourceUsage(resourceName)
+		return ri < rj
+	})
+
+	if len(nodeList) < replicas {
+		replicas = len(nodeList)
+	}
+
+	return nodeList[:replicas]
+}
+
+// placeHashBased uses consistent hashing for placement
+func (c *Cluster) placeHashBased(partitionID int, replicas int) []*Node {
+	if len(c.ring) == 0 || len(c.nodes) == 0 {
+		return nil
+	}
+
+	selected := make(map[string]*Node)
+	hash := uint32(partitionID * 1000)
+
+	for len(selected) < replicas {
+		idx := sort.Search(len(c.ring), func(i int) bool {
+			return c.ring[i].hash >= hash
+		})
+		if idx >= len(c.ring) {
+			idx = 0
+		}
+
+		node := c.ring[idx].node
+		if _, exists := selected[node.ID]; !exists {
+			selected[node.ID] = node
+		}
+
+		hash++
+	}
+
+	result := make([]*Node, 0, len(selected))
+	for _, n := range selected {
+		result = append(result, n)
+	}
+
+	return result
+}
+
+// getNodesByLoad returns nodes sorted by current partition load (least loaded first)
+func (c *Cluster) getNodesByLoad() []*Node {
+	load := make(map[string]int)
+	for _, p := range c.partitions {
+		if p.Leader != nil {
+			load[p.Leader.ID]++
+		}
+		for _, f := range p.Followers {
+			load[f.ID]++
 		}
 	}
 
-	// Sort by hash for binary search
-	sort.Slice(c.ring, func(i, j int) bool {
-		return c.ring[i].hash < c.ring[j].hash
-	})
-}
-
-// assignPartitions assigns partitions to nodes
-func (c *Cluster) assignPartitions() {
-	// Reset all partitions
-	for i := 0; i < c.numParts; i++ {
-		c.partitions[i] = &Partition{ID: i}
-	}
-
-	if len(c.nodes) == 0 {
-		return
-	}
-
-	// Get nodes directly from the map (already holding lock)
-	nodesList := make([]*Node, 0, len(c.nodes))
+	nodeList := make([]*Node, 0, len(c.nodes))
 	for _, n := range c.nodes {
-		nodesList = append(nodesList, n)
+		nodeList = append(nodeList, n)
 	}
 
-	// Simple round-robin assignment for now
-	for i := 0; i < c.numParts; i++ {
-		part := c.partitions[i]
-		part.Leader = nodesList[i%len(nodesList)]
-		part.Leader.State = StateLeader
-	}
-}
+	sort.Slice(nodeList, func(i, j int) bool {
+		li := load[nodeList[i].ID]
+		lj := load[nodeList[j].ID]
+		return li < lj
+	})
 
-// hashKey generates a hash for a key
-func (c *Cluster) hashKey(key string) uint32 {
-	return crc32.ChecksumIEEE([]byte(key))
+	return nodeList
 }
 
 // ============================================================
@@ -304,9 +553,9 @@ func (c *Cluster) hashKey(key string) uint32 {
 type AssignmentStrategy string
 
 const (
-	StrategyRoundRobin    AssignmentStrategy = "ROUND_ROBIN"
-	StrategyHashBased     AssignmentStrategy = "HASH_BASED"
-	StrategyLoadBalanced  AssignmentStrategy = "LOAD_BALANCED"
+	StrategyRoundRobin   AssignmentStrategy = "ROUND_ROBIN"
+	StrategyHashBased   AssignmentStrategy = "HASH_BASED"
+	StrategyLoadBalanced AssignmentStrategy = "LOAD_BALANCED"
 )
 
 // AssignPartitions assigns partitions to nodes based on the given strategy
@@ -446,13 +695,39 @@ func (c *Cluster) getNodeList() []*Node {
 // Partition Movement - Rebalancing
 // ============================================================
 
+// PartitionMovement represents a planned partition movement
+type PartitionMovement struct {
+	PartitionID int
+	FromNode    *Node
+	ToNode      *Node
+	State       MovementState
+}
+
+// MovementState represents the state of a partition movement
+type MovementState string
+
+const (
+	MovementPending   MovementState = "PENDING"
+	MovementStarted   MovementState = "STARTED"
+	MovementCompleted MovementState = "COMPLETED"
+	MovementFailed    MovementState = "FAILED"
+)
+
+// AssignmentResult contains the result of an assignment operation
+type AssignmentResult struct {
+	PartitionID int
+	FromNode    *Node
+	ToNode      *Node
+	Success     bool
+	Error       error
+}
+
 // PlanMovement creates a movement plan to rebalance the cluster
 func (c *Cluster) PlanMovement(targetStrategy AssignmentStrategy) ([]PartitionMovement, error) {
 	c.mu.RLock()
 	current := c.GetAssignment()
 	c.mu.RUnlock()
 
-	// Simulate target state
 	temp := &Cluster{
 		numParts:   c.numParts,
 		nodes:      c.nodes,
@@ -462,7 +737,6 @@ func (c *Cluster) PlanMovement(targetStrategy AssignmentStrategy) ([]PartitionMo
 	temp.assignPartitionsStrategy(targetStrategy)
 	target := temp.GetAssignment()
 
-	// Build movement plan
 	plan := make([]PartitionMovement, 0)
 	for partID, fromNodeID := range current {
 		toNodeID := target[partID]
@@ -538,13 +812,75 @@ func (c *Cluster) ExecuteMovementPlan(plan []PartitionMovement) []AssignmentResu
 	return results
 }
 
+// ============================================================
+// Internal Helpers
+// ============================================================
+
+// rebuildRing rebuilds the consistent hashing ring
+func (c *Cluster) rebuildRing() {
+	c.ring = make([]ringEntry, 0, len(c.nodes)*defaultVNodes)
+
+	nodeList := make([]*Node, 0, len(c.nodes))
+	for _, n := range c.nodes {
+		nodeList = append(nodeList, n)
+	}
+
+	for i, node := range nodeList {
+		node.PartitionIndex = i
+		for j := 0; j < defaultVNodes; j++ {
+			ringKey := fmt.Sprintf("%s-%d-%d", node.ID, node.Weight, j)
+			entry := ringEntry{
+				hash: c.hashKey(ringKey),
+				node: node,
+			}
+			c.ring = append(c.ring, entry)
+		}
+	}
+
+	sort.Slice(c.ring, func(i, j int) bool {
+		return c.ring[i].hash < c.ring[j].hash
+	})
+}
+
+// assignPartitions assigns partitions to nodes
+func (c *Cluster) assignPartitions() {
+	for i := 0; i < c.numParts; i++ {
+		c.partitions[i] = &Partition{ID: i}
+	}
+
+	if len(c.nodes) == 0 {
+		return
+	}
+
+	nodeList := make([]*Node, 0, len(c.nodes))
+	for _, n := range c.nodes {
+		nodeList = append(nodeList, n)
+	}
+
+	for i := 0; i < c.numParts; i++ {
+		part := c.partitions[i]
+		part.Leader = nodeList[i%len(nodeList)]
+		part.Leader.State = StateLeader
+	}
+}
+
+// hashKey generates a hash for a key
+func (c *Cluster) hashKey(key string) uint32 {
+	return crc32.ChecksumIEEE([]byte(key))
+}
+
+// ============================================================
 // Errors
+// ============================================================
+
 var (
-	ErrNodeExists            = &ClusterError{"node already exists"}
-	ErrNodeNotFound          = &ClusterError{"node not found"}
-	ErrNoNodesAvailable      = &ClusterError{"no nodes available"}
-	ErrPartitionNotFound     = &ClusterError{"partition not found"}
+	ErrNodeExists             = &ClusterError{"node already exists"}
+	ErrNodeNotFound           = &ClusterError{"node not found"}
+	ErrNoNodesAvailable       = &ClusterError{"no nodes available"}
+	ErrPartitionNotFound      = &ClusterError{"partition not found"}
 	ErrConcurrentModification = &ClusterError{"concurrent modification detected"}
+	ErrResourceExists        = &ClusterError{"resource already exists"}
+	ErrResourceNotFound      = &ClusterError{"resource not found"}
 )
 
 type ClusterError struct {
