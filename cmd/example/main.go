@@ -50,5 +50,42 @@ func main() {
 
 	fmt.Printf("\nPartition distribution: %v\n", partitions)
 
+	fmt.Println("\n=== Assignment Demo ===")
+
+	// Show current assignment
+	assignment := cluster.GetAssignment()
+	fmt.Println("Current assignment:")
+	for partID, nodeID := range assignment {
+		fmt.Printf("  Partition %d -> %s\n", partID, nodeID)
+	}
+
+	// Plan rebalancing
+	plan, err := cluster.PlanMovement(sharding.StrategyLoadBalanced)
+	if err != nil {
+		log.Printf("PlanMovement error: %v", err)
+	} else {
+		fmt.Printf("\nPlanned movements: %d\n", len(plan))
+		for _, m := range plan {
+			fmt.Printf("  Partition %d: %s -> %s\n", m.PartitionID, m.FromNode.ID, m.ToNode.ID)
+		}
+	}
+
+	// Execute movements
+	results := cluster.ExecuteMovementPlan(plan)
+	successCount := 0
+	for _, r := range results {
+		if r.Success {
+			successCount++
+		}
+	}
+	fmt.Printf("Executed: %d/%d successful\n", successCount, len(results))
+
+	// Show new assignment
+	assignment = cluster.GetAssignment()
+	fmt.Println("\nNew assignment after rebalancing:")
+	for partID, nodeID := range assignment {
+		fmt.Printf("  Partition %d -> %s\n", partID, nodeID)
+	}
+
 	fmt.Println("\n=== Demo Complete ===")
 }

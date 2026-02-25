@@ -32,10 +32,38 @@ func (n *Node) IsHealthy() bool {
 
 // Partition represents a data partition
 type Partition struct {
-	ID     int
-	Leader *Node
-	Followers []*Node
+	ID         int
+	Leader     *Node
+	Followers  []*Node
+	Version    int // For optimistic locking
 }
+
+// AssignmentResult contains the result of an assignment operation
+type AssignmentResult struct {
+	PartitionID int
+	FromNode    *Node
+	ToNode      *Node
+	Success     bool
+	Error       error
+}
+
+// PartitionMovement represents a planned partition movement
+type PartitionMovement struct {
+	PartitionID int
+	FromNode   *Node
+	ToNode     *Node
+	State      MovementState
+}
+
+// MovementState represents the state of a partition movement
+type MovementState string
+
+const (
+	MovementPending   MovementState = "PENDING"
+	MovementStarted   MovementState = "STARTED"
+	MovementCompleted MovementState = "COMPLETED"
+	MovementFailed    MovementState = "FAILED"
+)
 
 // Cluster manages the sharding cluster
 type Cluster struct {
@@ -246,10 +274,255 @@ func (c *Cluster) hashKey(key string) uint32 {
 	return crc32.ChecksumIEEE([]byte(key))
 }
 
+// ============================================================
+// Assignment - Partition Assignment Management
+// ============================================================
+
+// AssignmentStrategy defines how partitions are assigned to nodes
+type AssignmentStrategy string
+
+const (
+	StrategyRoundRobin    AssignmentStrategy = "ROUND_ROBIN"
+	StrategyHashBased     AssignmentStrategy = "HASH_BASED"
+	StrategyLoadBalanced  AssignmentStrategy = "LOAD_BALANCED"
+)
+
+// AssignPartitions assigns partitions to nodes based on the given strategy
+func (c *Cluster) AssignPartitions(strategy AssignmentStrategy) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if len(c.nodes) == 0 {
+		return ErrNoNodesAvailable
+	}
+
+	switch strategy {
+	case StrategyRoundRobin:
+		return c.assignRoundRobin()
+	case StrategyHashBased:
+		return c.assignHashBased()
+	case StrategyLoadBalanced:
+		return c.assignLoadBalanced()
+	default:
+		return c.assignRoundRobin()
+	}
+}
+
+// assignRoundRobin assigns partitions in round-robin fashion
+func (c *Cluster) assignRoundRobin() error {
+	nodeList := c.getNodeList()
+	if len(nodeList) == 0 {
+		return ErrNoNodesAvailable
+	}
+
+	for i := 0; i < c.numParts; i++ {
+		if c.partitions[i] == nil {
+			c.partitions[i] = &Partition{ID: i}
+		}
+		c.partitions[i].Leader = nodeList[i%len(nodeList)]
+		c.partitions[i].Leader.State = StateLeader
+		c.partitions[i].Version++
+	}
+
+	return nil
+}
+
+// assignHashBased assigns partitions based on consistent hash
+func (c *Cluster) assignHashBased() error {
+	c.rebuildRing()
+
+	for i := 0; i < c.numParts; i++ {
+		if c.partitions[i] == nil {
+			c.partitions[i] = &Partition{ID: i}
+		}
+
+		hash := uint32(i * 1000)
+		idx := sort.Search(len(c.ring), func(j int) bool {
+			return c.ring[j].hash >= hash
+		})
+		if idx >= len(c.ring) {
+			idx = 0
+		}
+		if len(c.ring) > 0 {
+			c.partitions[i].Leader = c.ring[idx].node
+			c.partitions[i].Leader.State = StateLeader
+			c.partitions[i].Version++
+		}
+	}
+
+	return nil
+}
+
+// assignLoadBalanced assigns partitions to minimize load imbalance
+func (c *Cluster) assignLoadBalanced() error {
+	nodeList := c.getNodeList()
+	if len(nodeList) == 0 {
+		return ErrNoNodesAvailable
+	}
+
+	load := make(map[string]int)
+	for _, n := range nodeList {
+		load[n.ID] = 0
+	}
+	for _, p := range c.partitions {
+		if p.Leader != nil {
+			load[p.Leader.ID]++
+		}
+	}
+
+	partitions := make([]int, 0, c.numParts)
+	for i := 0; i < c.numParts; i++ {
+		partitions = append(partitions, i)
+	}
+
+	for _, partID := range partitions {
+		minLoadNode := nodeList[0]
+		minLoad := load[minLoadNode.ID]
+		for _, n := range nodeList {
+			if load[n.ID] < minLoad {
+				minLoad = load[n.ID]
+				minLoadNode = n
+			}
+		}
+
+		if c.partitions[partID] == nil {
+			c.partitions[partID] = &Partition{ID: partID}
+		}
+		c.partitions[partID].Leader = minLoadNode
+		c.partitions[partID].Leader.State = StateLeader
+		c.partitions[partID].Version++
+		load[minLoadNode.ID]++
+	}
+
+	return nil
+}
+
+// GetAssignment returns the current partition assignment
+func (c *Cluster) GetAssignment() map[int]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	assignment := make(map[int]string)
+	for id, part := range c.partitions {
+		if part.Leader != nil {
+			assignment[id] = part.Leader.ID
+		}
+	}
+	return assignment
+}
+
+// getNodeList returns nodes as a list (internal helper)
+func (c *Cluster) getNodeList() []*Node {
+	list := make([]*Node, 0, len(c.nodes))
+	for _, n := range c.nodes {
+		list = append(list, n)
+	}
+	return list
+}
+
+// ============================================================
+// Partition Movement - Rebalancing
+// ============================================================
+
+// PlanMovement creates a movement plan to rebalance the cluster
+func (c *Cluster) PlanMovement(targetStrategy AssignmentStrategy) ([]PartitionMovement, error) {
+	c.mu.RLock()
+	current := c.GetAssignment()
+	c.mu.RUnlock()
+
+	// Simulate target state
+	temp := &Cluster{
+		numParts:   c.numParts,
+		nodes:      c.nodes,
+		partitions: make(map[int]*Partition),
+	}
+
+	temp.assignPartitionsStrategy(targetStrategy)
+	target := temp.GetAssignment()
+
+	// Build movement plan
+	plan := make([]PartitionMovement, 0)
+	for partID, fromNodeID := range current {
+		toNodeID := target[partID]
+		if fromNodeID != toNodeID {
+			fromNode := c.nodes[fromNodeID]
+			toNode := c.nodes[toNodeID]
+			plan = append(plan, PartitionMovement{
+				PartitionID: partID,
+				FromNode:    fromNode,
+				ToNode:      toNode,
+				State:       MovementPending,
+			})
+		}
+	}
+
+	return plan, nil
+}
+
+// assignPartitionsStrategy applies a strategy (internal helper)
+func (c *Cluster) assignPartitionsStrategy(strategy AssignmentStrategy) {
+	switch strategy {
+	case StrategyRoundRobin:
+		c.assignRoundRobin()
+	case StrategyHashBased:
+		c.assignHashBased()
+	case StrategyLoadBalanced:
+		c.assignLoadBalanced()
+	}
+}
+
+// ExecuteMovement executes a partition movement
+func (c *Cluster) ExecuteMovement(movement PartitionMovement) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	part, ok := c.partitions[movement.PartitionID]
+	if !ok {
+		return ErrPartitionNotFound
+	}
+
+	if movement.FromNode != nil && part.Leader != movement.FromNode {
+		return ErrConcurrentModification
+	}
+
+	part.Leader = movement.ToNode
+	part.Leader.State = StateLeader
+	part.Version++
+
+	return nil
+}
+
+// ExecuteMovementPlan executes a series of movements
+func (c *Cluster) ExecuteMovementPlan(plan []PartitionMovement) []AssignmentResult {
+	results := make([]AssignmentResult, 0, len(plan))
+
+	for _, m := range plan {
+		result := AssignmentResult{
+			PartitionID: m.PartitionID,
+			FromNode:    m.FromNode,
+			ToNode:      m.ToNode,
+		}
+
+		err := c.ExecuteMovement(m)
+		if err != nil {
+			result.Success = false
+			result.Error = err
+		} else {
+			result.Success = true
+		}
+		results = append(results, result)
+	}
+
+	return results
+}
+
 // Errors
 var (
-	ErrNodeExists   = &ClusterError{"node already exists"}
-	ErrNodeNotFound = &ClusterError{"node not found"}
+	ErrNodeExists            = &ClusterError{"node already exists"}
+	ErrNodeNotFound          = &ClusterError{"node not found"}
+	ErrNoNodesAvailable      = &ClusterError{"no nodes available"}
+	ErrPartitionNotFound     = &ClusterError{"partition not found"}
+	ErrConcurrentModification = &ClusterError{"concurrent modification detected"}
 )
 
 type ClusterError struct {
