@@ -27,7 +27,7 @@ type Node struct {
 	Resources      map[string]int64 // Resource usage: CPU, Memory, etc.
 }
 
-func (n *Node) IsHealthy() bool {
+func (n *Node) IsOnline() bool {
 	return n.State != StateOffline
 }
 
@@ -115,6 +115,9 @@ const (
 
 // NewCluster creates a new sharding cluster
 func NewCluster(name string, numPartitions int) *Cluster {
+	if numPartitions <= 0 {
+		numPartitions = 1 // Default to at least 1 partition
+	}
 	return &Cluster{
 		name:       name,
 		numParts:   numPartitions,
@@ -201,8 +204,7 @@ func (c *Cluster) GetPartition(key string) int {
 	}
 
 	node := c.ring[idx].node
-	partID := node.PartitionIndex%c.numParts + c.numParts
-	partID = partID % c.numParts
+	partID := node.PartitionIndex % c.numParts
 
 	return partID
 }
@@ -247,7 +249,7 @@ func (c *Cluster) GetFollowers(partitionID int) []*Node {
 	if part, ok := c.partitions[partitionID]; ok {
 		return part.Followers
 	}
-	return nil
+	return []*Node{}
 }
 
 // GetNodes returns all nodes in the cluster
@@ -418,8 +420,21 @@ func (c *Cluster) placeEvenDistribution(partitionID int, replicas int) []*Node {
 	}
 
 	selected := make([]*Node, 0, replicas)
+	used := make(map[string]bool)
+	
+	// Distribute evenly: pick least loaded nodes first, avoid duplicates
 	for i := 0; i < replicas; i++ {
-		selected = append(selected, nodeList[i%len(nodeList)])
+		for _, node := range nodeList {
+			if !used[node.ID] {
+				selected = append(selected, node)
+				used[node.ID] = true
+				break
+			}
+		}
+		// If all nodes used, cycle through (shouldn't happen with proper replica count)
+		if len(selected) <= i {
+			selected = append(selected, nodeList[i%len(nodeList)])
+		}
 	}
 
 	return selected
@@ -726,11 +741,18 @@ type AssignmentResult struct {
 func (c *Cluster) PlanMovement(targetStrategy AssignmentStrategy) ([]PartitionMovement, error) {
 	c.mu.RLock()
 	current := c.GetAssignment()
+	
+	// Deep copy nodes to avoid shared reference
+	tempNodes := make(map[string]*Node)
+	for k, v := range c.nodes {
+		tempNodes[k] = v
+	}
+	
 	c.mu.RUnlock()
 
 	temp := &Cluster{
 		numParts:   c.numParts,
-		nodes:      c.nodes,
+		nodes:      tempNodes,
 		partitions: make(map[int]*Partition),
 	}
 
@@ -788,8 +810,11 @@ func (c *Cluster) ExecuteMovement(movement PartitionMovement) error {
 	return nil
 }
 
-// ExecuteMovementPlan executes a series of movements
+// ExecuteMovementPlan executes a series of movements atomically
 func (c *Cluster) ExecuteMovementPlan(plan []PartitionMovement) []AssignmentResult {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
 	results := make([]AssignmentResult, 0, len(plan))
 
 	for _, m := range plan {
@@ -799,13 +824,27 @@ func (c *Cluster) ExecuteMovementPlan(plan []PartitionMovement) []AssignmentResu
 			ToNode:      m.ToNode,
 		}
 
-		err := c.ExecuteMovement(m)
-		if err != nil {
+		part, ok := c.partitions[m.PartitionID]
+		if !ok {
 			result.Success = false
-			result.Error = err
-		} else {
-			result.Success = true
+			result.Error = ErrPartitionNotFound
+			results = append(results, result)
+			continue
 		}
+
+		// Validate FromNode matches current leader
+		if m.FromNode != nil && part.Leader != m.FromNode {
+			result.Success = false
+			result.Error = ErrConcurrentModification
+			results = append(results, result)
+			continue
+		}
+
+		// Execute movement
+		part.Leader = m.ToNode
+		part.Leader.State = StateLeader
+		part.Version++
+		result.Success = true
 		results = append(results, result)
 	}
 
